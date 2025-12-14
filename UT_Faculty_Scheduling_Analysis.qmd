@@ -1,0 +1,1002 @@
+---
+title: "UT Faculty Scheduling: Predicting Staffing Preferences"
+author: "Elizabeth Obst"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    theme: flatly
+execute:
+  warning: false
+  message: false
+---
+
+```{r setup}
+# load libraries
+library(tidyverse)
+library(lubridate)
+library(caret)
+library(MASS)
+library(e1071)
+library(nnet)
+library(knitr)
+library(kableExtra)
+library(viridis)
+library(patchwork)
+library(glmnet)
+
+set.seed(42)
+
+theme_set(theme_minimal(base_size = 12))
+```
+
+# Introduction
+
+The University of Texas anesthesiology department manages a complex scheduling system coordinating attending physicians (faculty), Certified Registered Nurse Anesthetists (CRNAs), and anesthesia residents across multiple operating rooms and shifts. This analysis aims to understand faculty preferences for team composition and specific staff members.
+
+**Research Questions:**
+
+1. What are each faculty member's staffing type preferences (CRNAs only, residents only, or mixed)?
+2. What are the team size preferences for each faculty member?
+3. Which specific CRNAs or residents does each faculty prefer to work with?
+
+# Data Loading and Preprocessing
+
+```{r load-data}
+# read the data
+data <- read.csv("UT_Faculty_Scheduling_Anon.csv", blank.lines.skip = FALSE)
+
+# convert date
+data$Date <- as.Date(data$Date, format = "%m/%d/%y")
+
+# remove blank rows
+data <- data %>% filter(!is.na(Faculty) & Faculty != "")
+
+# basic info
+cat("Total records:", nrow(data), "\n")
+cat("Date range:", as.character(min(data$Date, na.rm = TRUE)), "to", 
+    as.character(max(data$Date, na.rm = TRUE)), "\n")
+cat("Number of unique faculty:", n_distinct(data$Faculty), "\n")
+```
+
+```{r identify-columns}
+# identify CRNA and Resident columns
+crna_cols <- names(data)[grepl("^CRNA_", names(data))]
+resident_cols <- names(data)[grepl("^Resident_", names(data))]
+
+cat("Number of CRNA columns:", length(crna_cols), "\n")
+cat("Number of Resident columns:", length(resident_cols), "\n")
+```
+
+```{r create-variables}
+# count CRNAs and Residents per shift first
+data$CRNA_Count <- rowSums(data[, crna_cols] == TRUE, na.rm = TRUE)
+data$Resident_Count <- rowSums(data[, resident_cols] == TRUE, na.rm = TRUE)
+data$Total_Team_Size <- data$CRNA_Count + data$Resident_Count
+
+# create staffing variables
+data <- data %>%
+  mutate(
+    # create staffing type
+    Staffing_Type = case_when(
+      CRNA_Count > 0 & Resident_Count == 0 ~ "CRNA_Only",
+      Resident_Count > 0 & CRNA_Count == 0 ~ "Resident_Only",
+      CRNA_Count > 0 & Resident_Count > 0 ~ "Mixed",
+      TRUE ~ "None"
+    ),
+    
+    # temporal features
+    WeekdayName = factor(weekdays(Date), 
+                         levels = c("Monday", "Tuesday", "Wednesday", 
+                                    "Thursday", "Friday", "Saturday", "Sunday")),
+    WeekdayNum = wday(Date, week_start = 1),
+    MonthName = factor(month(Date, label = TRUE)),
+    Week = week(Date),
+    Quarter = quarter(Date),
+    
+    # shift duration
+    Shift_Duration = case_when(
+      grepl("7-3", Shift_x) ~ "7-3",
+      grepl("7-5", Shift_x) ~ "7-5",
+      TRUE ~ "Other"
+    )
+  )
+
+# filter out none staffing type
+data <- data %>% filter(Staffing_Type != "None")
+
+# make staffing type a factor
+data$Staffing_Type <- factor(data$Staffing_Type, 
+                              levels = c("CRNA_Only", "Mixed", "Resident_Only"))
+```
+
+# Exploratory Data Analysis
+
+## Staffing Type Distribution
+
+```{r staffing-distribution}
+# calculate distribution
+staffing_dist <- data %>%
+  count(Staffing_Type) %>%
+  mutate(Percentage = round(n / sum(n) * 100, 2))
+
+# display table
+kable(staffing_dist, col.names = c("Staffing Type", "Count", "Percentage (%)"))
+```
+
+```{r staffing-plot}
+# visualize distribution
+ggplot(staffing_dist, aes(x = Staffing_Type, y = n, fill = Staffing_Type)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = paste0(n, " (", Percentage, "%)")), vjust = -0.5) +
+  scale_fill_viridis_d(option = "plasma", end = 0.8) +
+  labs(title = "Distribution of Staffing Types",
+       subtitle = "Data is highly imbalanced - Mixed staffing is rare (~7%)",
+       x = "Staffing Type",
+       y = "Number of Shifts") +
+  theme(legend.position = "none") +
+  ylim(0, max(staffing_dist$n) * 1.15)
+```
+
+The data shows significant class imbalance with CRNA_Only shifts comprising about 57% of all records, while Mixed staffing represents only about 7%.
+
+## Team Size Distribution
+
+```{r team-size-dist}
+# team size summary
+team_summary <- data %>%
+  group_by(Staffing_Type) %>%
+  summarise(
+    Mean_CRNA = round(mean(CRNA_Count), 2),
+    Mean_Resident = round(mean(Resident_Count), 2),
+    Mean_Total = round(mean(Total_Team_Size), 2),
+    Median_Total = median(Total_Team_Size),
+    SD_Total = round(sd(Total_Team_Size), 2)
+  )
+
+kable(team_summary, col.names = c("Staffing Type", "Mean CRNAs", "Mean Residents", 
+                                   "Mean Total", "Median Total", "SD Total"))
+```
+
+```{r team-size-boxplot}
+# boxplot of team sizes by staffing type
+ggplot(data, aes(x = Staffing_Type, y = Total_Team_Size, fill = Staffing_Type)) +
+  geom_boxplot() +
+  scale_fill_viridis_d(option = "plasma", end = 0.8) +
+  labs(title = "Team Size Distribution by Staffing Type",
+       x = "Staffing Type",
+       y = "Total Team Size") +
+  theme(legend.position = "none")
+```
+
+## Faculty-Level Analysis
+
+```{r faculty-preferences}
+# calculate faculty preferences
+faculty_prefs <- data %>%
+  group_by(Faculty) %>%
+  summarise(
+    Total_Shifts = n(),
+    CRNA_Only_Pct = round(sum(Staffing_Type == "CRNA_Only") / n() * 100, 1),
+    Mixed_Pct = round(sum(Staffing_Type == "Mixed") / n() * 100, 1),
+    Resident_Only_Pct = round(sum(Staffing_Type == "Resident_Only") / n() * 100, 1),
+    Avg_Team_Size = round(mean(Total_Team_Size), 2),
+    Avg_CRNA_Count = round(mean(CRNA_Count), 2),
+    Avg_Resident_Count = round(mean(Resident_Count), 2)
+  ) %>%
+  arrange(desc(Total_Shifts))
+
+# show top 15 faculty by shift count
+kable(head(faculty_prefs, 15), 
+      col.names = c("Faculty", "Total Shifts", "CRNA Only %", "Mixed %", 
+                    "Resident Only %", "Avg Team", "Avg CRNAs", "Avg Residents"))
+```
+
+```{r faculty-mixed-usage}
+# categorize faculty by mixed team usage
+mixed_high <- sum(faculty_prefs$Mixed_Pct > 20)
+mixed_medium <- sum(faculty_prefs$Mixed_Pct >= 10 & faculty_prefs$Mixed_Pct <= 20)
+mixed_low <- sum(faculty_prefs$Mixed_Pct < 10)
+
+cat("Faculty who use Mixed >20% of time:", mixed_high, "\n")
+cat("Faculty who use Mixed 10-20% of time:", mixed_medium, "\n")
+cat("Faculty who use Mixed <10% of time:", mixed_low, "\n")
+```
+
+## Temporal Patterns
+
+```{r weekday-patterns}
+# staffing by weekday
+weekday_staffing <- data %>%
+  filter(WeekdayName %in% c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday")) %>%
+  count(WeekdayName, Staffing_Type) %>%
+  group_by(WeekdayName) %>%
+  mutate(Pct = n / sum(n) * 100)
+
+ggplot(weekday_staffing, aes(x = WeekdayName, y = n, fill = Staffing_Type)) +
+  geom_col(position = "dodge") +
+  scale_fill_viridis_d(option = "plasma", end = 0.8) +
+  labs(title = "Staffing Patterns by Weekday",
+       x = "Weekday",
+       y = "Number of Shifts",
+       fill = "Staffing Type")
+```
+
+```{r monthly-patterns}
+# monthly trends
+monthly_staffing <- data %>%
+  count(MonthName, Staffing_Type) %>%
+  group_by(MonthName) %>%
+  mutate(Pct = n / sum(n) * 100)
+
+ggplot(monthly_staffing, aes(x = MonthName, y = Pct, color = Staffing_Type, group = Staffing_Type)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_viridis_d(option = "plasma", end = 0.8) +
+  labs(title = "Monthly Staffing Type Trends",
+       x = "Month",
+       y = "Percentage of Shifts",
+       color = "Staffing Type") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Most Frequently Scheduled Staff
+
+```{r top-crnas}
+# find most scheduled CRNAs
+crna_sums <- colSums(data[, crna_cols] == TRUE, na.rm = TRUE)
+crna_counts <- data.frame(
+  CRNA = names(crna_sums),
+  Shifts = as.numeric(crna_sums)
+) %>%
+  arrange(desc(Shifts)) %>%
+  head(15)
+
+ggplot(crna_counts, aes(x = reorder(CRNA, Shifts), y = Shifts)) +
+  geom_col(fill = "#3b528b") +
+  coord_flip() +
+  labs(title = "Top 15 Most Frequently Scheduled CRNAs",
+       x = "CRNA",
+       y = "Number of Shifts")
+```
+
+```{r top-residents}
+# find most scheduled residents
+resident_sums <- colSums(data[, resident_cols] == TRUE, na.rm = TRUE)
+resident_counts <- data.frame(
+  Resident = names(resident_sums),
+  Shifts = as.numeric(resident_sums)
+) %>%
+  arrange(desc(Shifts)) %>%
+  head(15)
+
+ggplot(resident_counts, aes(x = reorder(Resident, Shifts), y = Shifts)) +
+  geom_col(fill = "#5ec962") +
+  coord_flip() +
+  labs(title = "Top 15 Most Frequently Scheduled Residents",
+       x = "Resident",
+       y = "Number of Shifts")
+```
+
+## Availability vs Team Size
+
+```{r correlation-plot}
+# correlation between room count and team size
+ggplot(data, aes(x = Avg_Room_Count, y = Total_Team_Size)) +
+  geom_point(alpha = 0.3, color = "#3b528b") +
+  geom_smooth(method = "lm", color = "red") +
+  labs(title = "Room Count vs Team Size",
+       subtitle = paste("Correlation:", round(cor(data$Avg_Room_Count, data$Total_Team_Size, 
+                                                   use = "complete.obs"), 3)),
+       x = "Average Room Count",
+       y = "Total Team Size")
+```
+
+# Hypothesis Testing
+
+## Test 1: Chi-square test for staffing type and weekday
+
+We test whether the distribution of staffing types differs significantly across weekdays.
+
+```{r test1-chi-square}
+# create contingency table for weekdays (excluding weekends)
+weekday_data <- data %>%
+  filter(WeekdayName %in% c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday"))
+
+# drop unused factor levels before creating table
+weekday_data$WeekdayName <- droplevels(weekday_data$WeekdayName)
+
+staffing_weekday_table <- table(weekday_data$WeekdayName, weekday_data$Staffing_Type)
+print(staffing_weekday_table)
+
+# chi-square test
+chi_test <- chisq.test(staffing_weekday_table)
+print(chi_test)
+```
+
+**Interpretation:** The chi-square test shows no significant association between weekday and staffing type (p = 0.779). Staffing patterns remain consistent across weekdays.
+
+## Test 2: Correlation between room count and team size
+
+We test whether higher room counts are associated with larger team sizes.
+
+```{r test2-correlation}
+# pearson correlation test
+cor_test <- cor.test(data$Avg_Room_Count, data$Total_Team_Size)
+print(cor_test)
+```
+
+
+## Test 3: T-test comparing team sizes on holidays vs non-holidays
+
+```{r test3-ttest}
+# separate holiday and non-holiday data
+holiday_data <- data %>% filter(Holiday == TRUE)
+non_holiday_data <- data %>% filter(Holiday == FALSE)
+
+cat("Holiday shifts:", nrow(holiday_data), "\n")
+cat("Non-holiday shifts:", nrow(non_holiday_data), "\n")
+
+# t-test
+t_test_result <- t.test(holiday_data$Total_Team_Size, non_holiday_data$Total_Team_Size)
+print(t_test_result)
+```
+
+**Interpretation:** There is no significant difference in team size between holiday and non-holiday shifts (p = 0.739). The department maintains consistent staffing regardless of holiday status.
+
+```{r}
+# Test 4
+# test if team sizes differ significantly across faculty
+# use top 15 faculty with most shifts for cleaner analysis
+top_fac <- faculty_prefs %>% head(15) %>% pull(Faculty)
+faculty_subset <- data %>% filter(Faculty %in% top_fac)
+
+anova_faculty <- aov(Total_Team_Size ~ Faculty, data = faculty_subset)
+summary(anova_faculty)
+```
+```{r}
+# Test 5
+# test if staffing type preferences differ across faculty
+top_fac <- faculty_prefs %>% head(15) %>% pull(Faculty)
+faculty_subset <- data %>% filter(Faculty %in% top_fac)
+
+# Convert to factor FIRST, then drop levels
+faculty_subset$Faculty <- factor(faculty_subset$Faculty)
+faculty_subset$Faculty <- droplevels(faculty_subset$Faculty)
+
+# Or do it in one line:
+# faculty_subset$Faculty <- droplevels(factor(faculty_subset$Faculty))
+
+staffing_faculty_table <- table(faculty_subset$Faculty, faculty_subset$Staffing_Type)
+print(staffing_faculty_table)
+
+chi_faculty <- chisq.test(staffing_faculty_table)
+print(chi_faculty)
+```
+
+```{r}
+# Correlation
+# test if faculty use more CRNAs when more are available
+cor.test(data$Avg_CRNA_Count, data$CRNA_Count)
+```
+
+
+# Feature Engineering
+
+```{r feature-engineering}
+# create features for modeling
+data <- data %>%
+  mutate(
+    # team size categories
+    Team_Size_Category = case_when(
+      Total_Team_Size <= 2 ~ "Small",
+      Total_Team_Size <= 4 ~ "Medium",
+      TRUE ~ "Large"
+    ),
+    Team_Size_Category = factor(Team_Size_Category, levels = c("Small", "Medium", "Large")),
+    
+    # is weekend
+    Is_Weekend = WeekdayName %in% c("Saturday", "Sunday"),
+    
+    # years of experience (if available)
+    Years_Experience = ifelse(!is.na(YearsSinceMedSchoolGraduation), 
+                               YearsSinceMedSchoolGraduation, 0),
+    
+    # experience category
+    Experience_Category = case_when(
+      Years_Experience <= 5 ~ "Junior",
+      Years_Experience <= 15 ~ "Mid-Career",
+      TRUE ~ "Senior"
+    ),
+    Experience_Category = factor(Experience_Category, 
+                                  levels = c("Junior", "Mid-Career", "Senior"))
+  )
+
+# calculate faculty-level historical features
+faculty_history <- data %>%
+  group_by(Faculty) %>%
+  summarise(
+    Hist_Avg_Team_Size = mean(Total_Team_Size),
+    Hist_Avg_CRNA = mean(CRNA_Count),
+    Hist_Avg_Resident = mean(Resident_Count),
+    Hist_CRNA_Only_Rate = mean(Staffing_Type == "CRNA_Only"),
+    Hist_Mixed_Rate = mean(Staffing_Type == "Mixed"),
+    Hist_Resident_Only_Rate = mean(Staffing_Type == "Resident_Only"),
+    Hist_Shift_Count = n()
+  )
+
+# merge back to main data
+data <- data %>%
+  left_join(faculty_history, by = "Faculty")
+
+cat("Features created successfully\n")
+cat("Total features available:", ncol(data), "\n")
+```
+
+# Modeling
+
+## Data Preparation
+
+```{r data-prep}
+# select features for modeling
+keep_cols <- c("Staffing_Type", "Team_Size_Category", "Avg_CRNA_Count", "Avg_Res_Count", 
+               "Avg_Room_Count", "WeekdayNum", "Holiday", "Shift_Duration",
+               "Hist_Avg_Team_Size", "Hist_CRNA_Only_Rate", "Hist_Mixed_Rate", 
+               "Hist_Resident_Only_Rate", "Years_Experience", "CT_Team", "APS_Team", 
+               "HB_Team", "BR_Team", "Faculty", "CRNA_Count", "Resident_Count")
+
+model_data <- data[, keep_cols]
+model_data <- model_data %>% drop_na()
+
+cat("Records for modeling:", nrow(model_data), "\n")
+
+# time-based split (80% train, 20% test)
+train_size <- floor(0.8 * nrow(model_data))
+train_data <- model_data[1:train_size, ]
+test_data <- model_data[(train_size + 1):nrow(model_data), ]
+
+cat("Training set size:", nrow(train_data), "\n")
+cat("Test set size:", nrow(test_data), "\n")
+```
+
+## Staffing Type Preference Model
+
+This model predicts whether a faculty member will work with CRNAs only, residents only, or a mixed team.
+
+### Multinomial Logistic Regression
+
+```{r model1-logistic}
+# fit multinomial logistic regression
+log_model <- multinom(Staffing_Type ~ Avg_CRNA_Count + Avg_Res_Count + Avg_Room_Count + 
+                        Hist_CRNA_Only_Rate + Hist_Mixed_Rate + Years_Experience,
+                      data = train_data, trace = FALSE)
+
+# predictions
+log_pred <- predict(log_model, newdata = test_data)
+
+# make sure both are factors with same levels
+log_pred <- factor(log_pred, levels = levels(test_data$Staffing_Type))
+
+# confusion matrix
+log_cm <- confusionMatrix(log_pred, test_data$Staffing_Type)
+print(log_cm)
+```
+
+### Linear Discriminant Analysis
+
+```{r model1-lda}
+# fit LDA
+lda_model <- lda(Staffing_Type ~ Avg_CRNA_Count + Avg_Res_Count + Avg_Room_Count + 
+                   WeekdayNum + Hist_CRNA_Only_Rate + Hist_Mixed_Rate + Years_Experience,
+                 data = train_data)
+
+# predictions
+lda_pred <- predict(lda_model, newdata = test_data)$class
+
+# confusion matrix
+lda_cm <- confusionMatrix(lda_pred, test_data$Staffing_Type)
+print(lda_cm)
+```
+
+### Support Vector Machine
+
+```{r model1-svm}
+# fit SVM with radial kernel
+svm_model <- svm(Staffing_Type ~ Avg_CRNA_Count + Avg_Res_Count + Avg_Room_Count + 
+                   WeekdayNum + Hist_CRNA_Only_Rate + Hist_Mixed_Rate + Years_Experience,
+                 data = train_data, kernel = "radial", cost = 1)
+
+# predictions
+svm_pred <- predict(svm_model, newdata = test_data)
+
+# confusion matrix
+svm_cm <- confusionMatrix(svm_pred, test_data$Staffing_Type)
+print(svm_cm)
+```
+```{r}
+# fit SVM with radial kernel
+svm_model <- svm(Staffing_Type ~ Avg_CRNA_Count + Avg_Res_Count + Avg_Room_Count + 
+                   Hist_CRNA_Only_Rate + Hist_Mixed_Rate + Years_Experience,
+                 data = train_data, kernel = "radial", cost = 1)
+
+# predictions
+svm_pred <- predict(svm_model, newdata = test_data)
+
+# confusion matrix
+svm_cm <- confusionMatrix(svm_pred, test_data$Staffing_Type)
+print(svm_cm)
+```
+
+
+
+### Staffing Type Model Comparison
+
+```{r model1-comparison}
+# compare all three models
+model1_results <- data.frame(
+  Model = c("Logistic Regression", "LDA", "SVM"),
+  Accuracy = c(log_cm$overall["Accuracy"],
+               lda_cm$overall["Accuracy"],
+               svm_cm$overall["Accuracy"]),
+  Kappa = c(log_cm$overall["Kappa"],
+            lda_cm$overall["Kappa"],
+            svm_cm$overall["Kappa"])
+)
+
+kable(model1_results, digits = 4, 
+      col.names = c("Model", "Accuracy", "Kappa"))
+```
+
+## Team Size Preference Model
+
+This model predicts whether a faculty member will use a small, medium, or large team.
+
+### Multinomial Logistic Regression
+
+```{r model2-logistic}
+# fit multinomial logistic regression for team size
+log_model2 <- multinom(Team_Size_Category ~ Avg_CRNA_Count + Avg_Res_Count + Avg_Room_Count + 
+                         WeekdayNum + Hist_Avg_Team_Size + Years_Experience + Staffing_Type,
+                       data = train_data, trace = FALSE)
+
+# predictions
+log_pred2 <- predict(log_model2, newdata = test_data)
+
+# confusion matrix
+log_cm2 <- confusionMatrix(log_pred2, test_data$Team_Size_Category)
+print(log_cm2)
+```
+
+### Linear Discriminant Analysis
+
+```{r model2-lda}
+# fit LDA for team size
+lda_model2 <- lda(Team_Size_Category ~ Avg_CRNA_Count + Avg_Res_Count + Avg_Room_Count + 
+                    WeekdayNum + Hist_Avg_Team_Size + Years_Experience + Staffing_Type,
+                  data = train_data)
+
+# predictions
+lda_pred2 <- predict(lda_model2, newdata = test_data)$class
+
+# confusion matrix
+lda_cm2 <- confusionMatrix(lda_pred2, test_data$Team_Size_Category)
+print(lda_cm2)
+```
+
+### Support Vector Machine
+
+```{r model2-svm}
+# fit SVM for team size
+svm_model2 <- svm(Team_Size_Category ~ Avg_CRNA_Count + Avg_Res_Count + Avg_Room_Count + 
+                    WeekdayNum + Hist_Avg_Team_Size + Years_Experience + Staffing_Type,
+                  data = train_data, kernel = "radial", cost = 1)
+
+# predictions
+svm_pred2 <- predict(svm_model2, newdata = test_data)
+
+# confusion matrix
+svm_cm2 <- confusionMatrix(svm_pred2, test_data$Team_Size_Category)
+print(svm_cm2)
+```
+
+### Team Size Model Comparison
+
+```{r model2-comparison}
+# compare all three models
+model2_results <- data.frame(
+  Model = c("Logistic Regression", "LDA", "SVM"),
+  Accuracy = c(log_cm2$overall["Accuracy"],
+               lda_cm2$overall["Accuracy"],
+               svm_cm2$overall["Accuracy"]),
+  Kappa = c(log_cm2$overall["Kappa"],
+            lda_cm2$overall["Kappa"],
+            svm_cm2$overall["Kappa"])
+)
+
+kable(model2_results, digits = 4,
+      col.names = c("Model", "Accuracy", "Kappa"))
+```
+
+## Specific Staff Preference Model
+
+This model predicts which specific CRNAs a faculty member prefers to work with. Due to the highly imbalanced nature of this data, we focus on the top 15 most frequently scheduled CRNAs.
+
+```{r model3-prep}
+# get top 15 CRNAs
+top_crnas <- crna_counts$CRNA[1:15]
+
+# create subset with CRNA columns for this model
+keep_cols3 <- c("Faculty", "Avg_CRNA_Count", "Avg_Room_Count", "Hist_Avg_CRNA", top_crnas)
+
+# only keep columns that exist in the data
+keep_cols3 <- keep_cols3[keep_cols3 %in% names(data)]
+
+model3_data <- data[, keep_cols3]
+model3_data <- model3_data %>% drop_na()
+
+# split data
+train_size3 <- floor(0.8 * nrow(model3_data))
+train_data3 <- model3_data[1:train_size3, ]
+test_data3 <- model3_data[(train_size3 + 1):nrow(model3_data), ]
+
+cat("Modeling preferences for top 15 CRNAs\n")
+cat("Training size:", nrow(train_data3), "\n")
+cat("Test size:", nrow(test_data3), "\n")
+```
+
+### Multi-label Classification Results
+
+```{r model3-results}
+# store results for each CRNA
+crna_results <- data.frame(
+  CRNA = character(),
+  Logistic_Accuracy = numeric(),
+  SVM_Accuracy = numeric(),
+  Baseline_Accuracy = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# model each CRNA separately
+for (i in 1:min(10, length(top_crnas))) {
+  crna <- top_crnas[i]
+  
+  # create binary target
+  train_target <- as.factor(train_data3[[crna]] == TRUE)
+  test_target <- as.factor(test_data3[[crna]] == TRUE)
+  
+  # check class balance
+  train_positive <- sum(train_target == TRUE)
+  
+  # skip if too imbalanced
+  if (train_positive < 10) {
+    next
+  }
+  
+  # baseline accuracy
+  baseline_acc <- max(table(train_target)) / length(train_target)
+  
+  # create training dataframe
+  train_df <- data.frame(
+    target = train_target,
+    Avg_CRNA_Count = train_data3$Avg_CRNA_Count,
+    Avg_Room_Count = train_data3$Avg_Room_Count,
+    Hist_Avg_CRNA = train_data3$Hist_Avg_CRNA
+  )
+  
+  test_df <- data.frame(
+    target = test_target,
+    Avg_CRNA_Count = test_data3$Avg_CRNA_Count,
+    Avg_Room_Count = test_data3$Avg_Room_Count,
+    Hist_Avg_CRNA = test_data3$Hist_Avg_CRNA
+  )
+  
+  # logistic regression
+  log_m3 <- glm(target ~ Avg_CRNA_Count + Avg_Room_Count + Hist_Avg_CRNA,
+                data = train_df, family = binomial)
+  log_prob <- predict(log_m3, newdata = test_df, type = "response")
+  log_pred3 <- ifelse(log_prob > 0.5, TRUE, FALSE)
+  log_acc <- mean(log_pred3 == test_target)
+  
+  # SVM
+  svm_m3 <- svm(target ~ Avg_CRNA_Count + Avg_Room_Count + Hist_Avg_CRNA,
+                data = train_df, kernel = "radial", cost = 1)
+  svm_pred3 <- predict(svm_m3, newdata = test_df)
+  svm_acc <- mean(svm_pred3 == test_target)
+  
+  crna_results <- rbind(crna_results, data.frame(
+    CRNA = crna,
+    Logistic_Accuracy = round(log_acc, 4),
+    SVM_Accuracy = round(svm_acc, 4),
+    Baseline_Accuracy = round(baseline_acc, 4)
+  ))
+}
+
+kable(crna_results, 
+      col.names = c("CRNA", "Logistic Accuracy", "SVM Accuracy", "Baseline Accuracy"))
+```
+
+### Staff Preference Model Discussion
+
+```{r model3-summary}
+# average performance
+if (nrow(crna_results) > 0) {
+  avg_log <- mean(crna_results$Logistic_Accuracy, na.rm = TRUE)
+  avg_svm <- mean(crna_results$SVM_Accuracy, na.rm = TRUE)
+  avg_baseline <- mean(crna_results$Baseline_Accuracy, na.rm = TRUE)
+  
+  cat("Average Logistic Regression Accuracy:", round(avg_log, 4), "\n")
+  cat("Average SVM Accuracy:", round(avg_svm, 4), "\n")
+  cat("Average Baseline Accuracy:", round(avg_baseline, 4), "\n")
+}
+```
+
+The individual CRNA prediction task is challenging due to the extreme class imbalance. Most CRNAs work with any given faculty member less than 10% of the time. Both logistic regression and SVM struggle to substantially outperform the baseline accuracy, which highlights the inherent difficulty of this prediction task.
+
+## Faculty-CRNA Pairing Analysis
+
+```{r}
+# manually specify faculty to include (swap FacultyI for FacultyJ)
+top_faculty <- c("FacultyN", "Faculty48", "FacultyD", "FacultyX", "Faculty49", 
+                 "FacultyB", "Faculty47", "FacultyJ", 
+                  "FacultyQ", "Faculty50")
+
+# or if you want to keep the filter approach but ensure FacultyJ is included:
+# top_faculty <- faculty_prefs %>%
+#   filter(Total_Shifts >= 30) %>%
+#   filter(Faculty != "FacultyI") %>%  # remove FacultyI
+#   head(10) %>%
+#   pull(Faculty)
+
+# add FacultyJ if not already there
+if (!"FacultyJ" %in% top_faculty) {
+  top_faculty <- c(top_faculty, "FacultyJ")
+}
+
+# create pairing matrix
+pairing_matrix <- matrix(0, nrow = length(top_faculty), ncol = min(10, length(top_crnas)))
+rownames(pairing_matrix) <- top_faculty
+colnames(pairing_matrix) <- top_crnas[1:min(10, length(top_crnas))]
+
+for (i in seq_along(top_faculty)) {
+  fac <- top_faculty[i]
+  fac_data <- data %>% filter(Faculty == fac)
+  
+  for (j in 1:min(10, length(top_crnas))) {
+    crna <- top_crnas[j]
+    if (crna %in% names(fac_data)) {
+      pairing_matrix[i, j] <- sum(fac_data[[crna]] == TRUE, na.rm = TRUE) / nrow(fac_data) * 100
+    }
+  }
+}
+
+# convert to dataframe for plotting
+pairing_df <- as.data.frame(pairing_matrix) %>%
+  rownames_to_column("Faculty") %>%
+  pivot_longer(-Faculty, names_to = "CRNA", values_to = "Percentage")
+
+ggplot(pairing_df, aes(x = CRNA, y = Faculty, fill = Percentage)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "plasma") +
+  labs(title = "Faculty-CRNA Pairing Frequency",
+       subtitle = "Percentage of shifts where faculty worked with each CRNA",
+       x = "CRNA",
+       y = "Faculty",
+       fill = "% of Shifts") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+        axis.text.y = element_text(size = 8))
+```
+
+
+
+```{r}
+# Model 3 further attempt
+# store results for each CRNA
+crna_results <- data.frame(
+  CRNA = character(),
+  Ridge_Accuracy = numeric(),
+  Ridge_Sensitivity = numeric(),
+  SVM_Accuracy = numeric(),
+  SVM_Sensitivity = numeric(),
+  Baseline_Accuracy = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# use random split
+set.seed(42)
+train_idx <- sample(1:nrow(model3_data), size = floor(0.8 * nrow(model3_data)))
+train_data3_rand <- model3_data[train_idx, ]
+test_data3_rand <- model3_data[-train_idx, ]
+
+# create consistent factor levels for Faculty
+all_faculty <- unique(model3_data$Faculty)
+train_data3_rand$Faculty <- factor(train_data3_rand$Faculty, levels = all_faculty)
+test_data3_rand$Faculty <- factor(test_data3_rand$Faculty, levels = all_faculty)
+
+# model each CRNA separately
+for (i in 1:min(10, length(top_crnas))) {
+  crna <- top_crnas[i]
+  
+  # create binary target
+  train_target <- as.factor(train_data3_rand[[crna]] == TRUE)
+  test_target <- as.factor(test_data3_rand[[crna]] == TRUE)
+  
+  # check class balance
+  train_positive <- sum(train_target == TRUE)
+  test_positive <- sum(test_target == TRUE)
+  
+  if (train_positive < 10 | test_positive < 3) {
+    next
+  }
+  
+  # baseline accuracy
+  baseline_acc <- max(table(test_target)) / length(test_target)
+  
+  # create model matrix for glmnet
+  train_x <- model.matrix(~ Avg_CRNA_Count + Avg_Room_Count + Hist_Avg_CRNA + Faculty, 
+                          data = train_data3_rand)[, -1]
+  test_x <- model.matrix(~ Avg_CRNA_Count + Avg_Room_Count + Hist_Avg_CRNA + Faculty, 
+                         data = test_data3_rand)[, -1]
+  
+  train_y <- as.numeric(train_target == TRUE)
+  
+  # calculate class weights
+  weight_true <- sum(train_target == FALSE) / sum(train_target == TRUE)
+  weights <- ifelse(train_target == TRUE, weight_true, 1)
+  
+  # ridge logistic regression with class weights
+  ridge_m3 <- glmnet(train_x, train_y, family = "binomial", alpha = 0, weights = weights)
+  ridge_prob <- predict(ridge_m3, newx = test_x, s = 0.01, type = "response")
+  ridge_pred <- factor(ifelse(ridge_prob > 0.3, TRUE, FALSE), levels = c("FALSE", "TRUE"))
+  ridge_acc <- mean(ridge_pred == test_target)
+  ridge_sens <- sum(ridge_pred == TRUE & test_target == TRUE) / sum(test_target == TRUE)
+  
+  # SVM with higher class weights
+  train_df <- data.frame(
+    target = train_target,
+    Avg_CRNA_Count = train_data3_rand$Avg_CRNA_Count,
+    Avg_Room_Count = train_data3_rand$Avg_Room_Count,
+    Hist_Avg_CRNA = train_data3_rand$Hist_Avg_CRNA,
+    Faculty = train_data3_rand$Faculty
+  )
+  
+  test_df <- data.frame(
+    target = test_target,
+    Avg_CRNA_Count = test_data3_rand$Avg_CRNA_Count,
+    Avg_Room_Count = test_data3_rand$Avg_Room_Count,
+    Hist_Avg_CRNA = test_data3_rand$Hist_Avg_CRNA,
+    Faculty = test_data3_rand$Faculty
+  )
+  
+  svm_m3 <- svm(target ~ Avg_CRNA_Count + Avg_Room_Count + Hist_Avg_CRNA + Faculty,
+                data = train_df, kernel = "radial", 
+                class.weights = c("FALSE" = 1, "TRUE" = 20))
+  svm_pred3 <- predict(svm_m3, newdata = test_df)
+  svm_acc <- mean(svm_pred3 == test_target)
+  svm_sens <- sum(svm_pred3 == TRUE & test_target == TRUE) / sum(test_target == TRUE)
+  
+  crna_results <- rbind(crna_results, data.frame(
+    CRNA = crna,
+    Ridge_Accuracy = round(ridge_acc, 4),
+    Ridge_Sensitivity = round(ridge_sens, 4),
+    SVM_Accuracy = round(svm_acc, 4),
+    SVM_Sensitivity = round(svm_sens, 4),
+    Baseline_Accuracy = round(baseline_acc, 4)
+  ))
+}
+
+kable(crna_results, 
+      col.names = c("CRNA", "Ridge Accuracy", "Ridge Sensitivity", 
+                    "SVM Accuracy", "SVM Sensitivity", "Baseline"))
+```
+
+
+
+
+```{r}
+# pick one CRNA to demonstrate predictions
+demo_crna <- top_crnas[1]  # CRNA_CRNA27
+
+# get the predictions from the last model run (or rerun for this CRNA)
+train_target <- as.factor(train_data3_rand[[demo_crna]] == TRUE)
+test_target <- as.factor(test_data3_rand[[demo_crna]] == TRUE)
+
+train_x <- model.matrix(~ Avg_CRNA_Count + Avg_Room_Count + Hist_Avg_CRNA + Faculty, 
+                        data = train_data3_rand)[, -1]
+test_x <- model.matrix(~ Avg_CRNA_Count + Avg_Room_Count + Hist_Avg_CRNA + Faculty, 
+                       data = test_data3_rand)[, -1]
+
+train_y <- as.numeric(train_target == TRUE)
+weight_true <- sum(train_target == FALSE) / sum(train_target == TRUE)
+weights <- ifelse(train_target == TRUE, weight_true, 1)
+
+ridge_m3 <- glmnet(train_x, train_y, family = "binomial", alpha = 0, weights = weights)
+ridge_prob <- predict(ridge_m3, newx = test_x, s = 0.01, type = "response")
+
+# create results dataframe
+prediction_results <- data.frame(
+  Faculty = test_data3_rand$Faculty,
+  Actual = test_target == TRUE,
+  Predicted_Prob = as.numeric(ridge_prob),
+  Predicted = as.numeric(ridge_prob) > 0.3
+)
+
+# summarize by faculty - who does the model predict will work with this CRNA?
+faculty_predictions <- prediction_results %>%
+  group_by(Faculty) %>%
+  summarise(
+    Total_Shifts = n(),
+    Actual_Pairings = sum(Actual),
+    Actual_Rate = round(mean(Actual) * 100, 1),
+    Predicted_Pairings = sum(Predicted),
+    Predicted_Rate = round(mean(Predicted) * 100, 1),
+    Avg_Probability = round(mean(Predicted_Prob) * 100, 1)
+  ) %>%
+  filter(Total_Shifts >= 5) %>%
+  arrange(desc(Avg_Probability)) %>%
+  head(15)
+
+cat("Predictions for", demo_crna, "\n\n")
+kable(faculty_predictions,
+      col.names = c("Faculty", "Shifts", "Actual Pairings", "Actual %", 
+                    "Predicted Pairings", "Predicted %", "Avg Prob %"))
+```
+```{r}
+# summarize by faculty
+faculty_predictions <- prediction_results %>%
+  group_by(Faculty) %>%
+  summarise(
+    Total_Shifts = n(),
+    Actual_Pairings = sum(Actual),
+    Actual_Rate = round(mean(Actual) * 100, 1),
+    Avg_Probability = round(mean(Predicted_Prob) * 100, 1)
+  ) %>%
+  filter(Total_Shifts >= 5) %>%
+  arrange(desc(Avg_Probability))
+
+# show top 10 predicted
+cat("Top 10 Faculty predicted to work with", demo_crna, "\n")
+kable(head(faculty_predictions, 10),
+      col.names = c("Faculty", "Shifts", "Actual Pairings", "Actual %", "Model Prob %"))
+
+# show bottom 10 predicted  
+cat("\nBottom 10 Faculty predicted to work with", demo_crna, "\n")
+kable(tail(faculty_predictions, 10),
+      col.names = c("Faculty", "Shifts", "Actual Pairings", "Actual %", "Model Prob %"))
+```
+
+
+```{r}
+# show the pairings
+# plot predicted probability vs actual rate
+ggplot(faculty_predictions, aes(x = Actual_Rate, y = Avg_Probability)) +
+  geom_point(size = 3, color = "#3b528b") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  geom_text(aes(label = Faculty), hjust = -0.1, size = 3) +
+  labs(title = paste("Predicted vs Actual Pairing Rate for", demo_crna),
+       x = "Actual Pairing Rate (%)",
+       y = "Model Predicted Probability (%)") +
+  xlim(0, 100) +
+  ylim(0, 100)
+```
+
+# Summary and Recommendations
+
+```{r}
+# average performance
+avg_ridge_acc <- mean(crna_results$Ridge_Accuracy)
+avg_ridge_sens <- mean(crna_results$Ridge_Sensitivity)
+avg_svm_acc <- mean(crna_results$SVM_Accuracy)
+avg_svm_sens <- mean(crna_results$SVM_Sensitivity)
+avg_baseline <- mean(crna_results$Baseline_Accuracy)
+
+cat("Average Ridge Accuracy:", round(avg_ridge_acc, 4), "\n")
+cat("Average Ridge Sensitivity:", round(avg_ridge_sens, 4), "\n")
+cat("Average SVM Accuracy:", round(avg_svm_acc, 4), "\n")
+cat("Average SVM Sensitivity:", round(avg_svm_sens, 4), "\n")
+cat("Average Baseline Accuracy:", round(avg_baseline, 4), "\n")
+```
+
+
+
